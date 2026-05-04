@@ -1,0 +1,17 @@
+[phases.setup]
+nixPkgs = ["php84", "php84Extensions.pdo", "php84Extensions.pdo_mysql", "php84Extensions.mbstring", "php84Extensions.xml", "php84Extensions.curl", "php84Extensions.zip", "php84Extensions.bcmath", "php84Extensions.openssl", "php84Extensions.fileinfo", "php84Extensions.gmp"]
+
+[phases.install]
+cmds = [
+  "curl -sS https://getcomposer.org/installer | php84 -- --install-dir=/usr/local/bin --filename=composer",
+  "composer install --no-dev --optimize-autoloader --no-interaction"
+]
+
+[phases.build]
+cmds = [
+  "php84 artisan config:cache",
+  "php84 artisan route:cache"
+]
+
+[start]
+cmd = "php84 artisan migrate --force && php84 artisan db:seed --force && php84 artisan serve --host=0.0.0.0 --port=$PORT"
