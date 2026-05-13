@@ -109,7 +109,7 @@ class MarketplaceController extends Controller
     {
         $request->validate([
             'request_id' => ['required', 'integer'],
-            'tx_hash'    => ['required', 'string', 'min:10', 'max:200'],
+            'tx_hash'    => ["required", "string", "min:66", "max:66", "regex:/^0x[0-9a-fA-F]{64}$/"],
         ]);
 
         $user = $request->user();

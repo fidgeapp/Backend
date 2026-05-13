@@ -16,6 +16,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
 
 // BREVO SDK IMPORTS
 use Brevo\Client\Api\TransactionalEmailsApi;
@@ -47,6 +48,9 @@ class AdminController extends Controller
 
     /**
      * POST /api/admin/login
+     *
+     * Security: OTP key is now scoped per-username, not global.
+     * This prevents an attacker from overwriting another admin's OTP.
      */
     public function login(Request $request): JsonResponse
     {
@@ -55,15 +59,20 @@ class AdminController extends Controller
             'password'   => ['required', 'string'],
         ]);
 
-        // Verify credentials using validateAdminCredentials (supports both admins + bcrypt hashes)
         if (!$this->validateAdminCredentials($request->username, $request->password)) {
+            // Intentional delay to slow brute-force even if route throttle is bypassed
+            usleep(300_000);
             return response()->json(['error' => 'Invalid credentials'], 401);
         }
+
+        // OTP cache key scoped to username — not global — prevents one admin's
+        // login from overwriting/invalidating another admin's OTP
+        $otpCacheKey = 'admin_otp:' . $request->username;
 
         // Step 1: If OTP + TOTP not yet provided -> send OTP email and ask for both
         if (!$request->filled('otp') || !$request->filled('totp_code')) {
             $otp = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
-            cache()->put('admin_otp', $otp, now()->addMinutes(10));
+            Cache::put($otpCacheKey, $otp, now()->addMinutes(10));
 
             $adminEmail = env('ADMIN_EMAIL', 'fidgeappofficial@gmail.com');
 
@@ -71,7 +80,6 @@ class AdminController extends Controller
                 $this->sendOtpEmail($adminEmail, $otp, 'Admin Login Verification');
             } catch (\Exception $e) {
                 Log::error("Admin OTP Send Failed: " . $e->getMessage());
-
                 return response()->json([
                     'message' => 'Could not send login code. Please check server logs.',
                 ], 500);
@@ -83,9 +91,9 @@ class AdminController extends Controller
             ], 202);
         }
 
-        // Step 2: Verify OTP
-        $storedOtp = cache()->get('admin_otp');
-        if (!$storedOtp || $request->otp !== $storedOtp) {
+        // Step 2: Verify OTP (scoped to this username)
+        $storedOtp = Cache::get($otpCacheKey);
+        if (!$storedOtp || !hash_equals($storedOtp, $request->otp)) {
             return response()->json(['error' => 'Invalid or expired OTP'], 401);
         }
 
@@ -104,11 +112,11 @@ class AdminController extends Controller
             }
         }
 
-        // All checks passed — issue token in the format AdminAuth middleware expects
-        cache()->forget('admin_otp');
+        // All checks passed — issue token
+        Cache::forget($otpCacheKey);
 
-        $date    = now()->toDateString();                // e.g. "2025-05-01"
-        $exp     = now()->addHours(8)->timestamp;        // 8-hour session
+        $date    = now()->toDateString();
+        $exp     = now()->addHours(8)->timestamp;
         $sig     = hash_hmac('sha256', $request->username . $date, config('app.key'));
 
         $payload = base64_encode(json_encode([
@@ -383,9 +391,6 @@ class AdminController extends Controller
         return response()->json(['message' => 'Withdrawal deleted.']);
     }
 
-    /**
-     * PRIVATE METHOD: Sends the OTP via Brevo API
-     */
     private function sendOtpEmail(string $email, string $code, string $purpose): void
     {
         $subject = 'Fidge Admin Verification';
@@ -423,13 +428,6 @@ class AdminController extends Controller
         }
     }
 
-    /**
-     * POST /api/admin/leaderboard/resync
-     *
-     * One-time repair: for every user whose leaderboard entry points are LESS
-     * than their actual user.points, set the entry to user.points.
-     * Safe to run multiple times — it only ever increases, never decreases.
-     */
     public function resyncLeaderboard(): JsonResponse
     {
         $cycle   = LeaderboardCycle::current();

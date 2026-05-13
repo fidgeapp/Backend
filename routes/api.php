@@ -11,6 +11,8 @@ use App\Http\Controllers\AdminController;
 use App\Http\Controllers\MarketplaceController;
 use App\Http\Controllers\StatsController;
 use Illuminate\Support\Facades\Route;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Cache\RateLimiting\Limit;
 
 // ── OPTIONS preflight ─────────────────────────────────────────────────────────
 Route::options('{any}', fn() => response()->json([], 200))->where('any', '.*');
@@ -21,71 +23,75 @@ Route::get('/health', fn () => response()->json([
     'timestamp' => now()->toISOString(),
 ]));
 
-// ── Auth (public) ─────────────────────────────────────────────────────────────
+// ── Auth (public) — rate limited ──────────────────────────────────────────────
 Route::prefix('auth')->group(function () {
-    // Register flow
-    Route::post('/register/send-otp',  [AuthController::class, 'registerSendOtp']);
-    Route::post('/register/verify',    [AuthController::class, 'registerVerify']);
+    // Register flow — 5 attempts per IP per minute
+    Route::post('/register/send-otp',  [AuthController::class, 'registerSendOtp'])->middleware('throttle:5,1');
+    Route::post('/register/verify',    [AuthController::class, 'registerVerify'])->middleware('throttle:5,1');
 
-    // Login (direct — no OTP)
-    Route::post('/login',              [AuthController::class, 'login']);
+    // Login — 10 attempts per IP per minute (brute-force protection)
+    Route::post('/login',              [AuthController::class, 'login'])->middleware('throttle:10,1');
 
     // Authenticated
     Route::post('/logout',             [AuthController::class, 'logout'])->middleware('session.auth');
     Route::get('/me',                  [AuthController::class, 'me'])->middleware('session.auth');
 });
 
-// ── Public analytics (investor/sponsor dashboard) ─────────────────────────────
-Route::get('/stats', [StatsController::class, 'index']);
+// ── Public analytics (investor/sponsor dashboard) — heavily cached ─────────────
+Route::get('/stats', [StatsController::class, 'index'])->middleware('throttle:30,1');
 
 // ── Public endpoints ──────────────────────────────────────────────────────────
-Route::get('/leaderboard',       [LeaderboardController::class, 'index']);
-Route::get('/wheel/segments',    [WheelController::class, 'segments']);
-Route::get('/shop/skins',        [ShopController::class, 'index']);
+Route::get('/leaderboard',          [LeaderboardController::class, 'index'])->middleware('throttle:60,1');
+Route::get('/wheel/segments',       [WheelController::class, 'segments']);
+Route::get('/shop/skins',           [ShopController::class, 'index']);
 Route::get('/marketplace/packages', [MarketplaceController::class, 'packages_list']);
 
 // ── Authenticated user endpoints ──────────────────────────────────────────────
 Route::middleware(['session.auth', 'ban.check'])->group(function () {
 
-    // Spinner
+    // Spinner — rate limits enforced inside controller via Cache
     Route::prefix('spinner')->group(function () {
         Route::post('/sync',        [SpinnerController::class, 'sync']);
         Route::post('/session-end', [SpinnerController::class, 'sessionEnd']);
         Route::post('/watch-ad',    [SpinnerController::class, 'watchAd']);
     });
 
-    // Wheel
-    Route::post('/wheel/spin',       [WheelController::class, 'spin']);
-        Route::post('/wheel/spin-multi', [WheelController::class, 'spinMulti']);
+    // Wheel — rate limited: max 30 spins/minute per user
+    Route::post('/wheel/spin',       [WheelController::class, 'spin'])->middleware('throttle:30,1');
+    Route::post('/wheel/spin-multi', [WheelController::class, 'spinMulti'])->middleware('throttle:30,1');
 
     // Profile
     Route::prefix('profile')->group(function () {
-        Route::get('/',                [ProfileController::class, 'show']);
-        Route::post('/convert-points', [ProfileController::class, 'convertPoints']);
-        Route::post('/withdraw-pcedo',          [ProfileController::class, 'withdrawPcedo']);
-        Route::get('/withdrawals',                [ProfileController::class, 'myWithdrawals']);
-        Route::delete('/withdrawals/{id}',        [ProfileController::class, 'deleteWithdrawal']);
-        Route::post('/set-skin',       [ProfileController::class, 'setSkin']);
-        Route::post('/quests/{id}/confirm', [ProfileController::class, 'confirmQuest']);
+        Route::get('/',                    [ProfileController::class, 'show']);
+        Route::post('/convert-points',     [ProfileController::class, 'convertPoints'])->middleware('throttle:20,1');
+        Route::post('/withdraw-pcedo',     [ProfileController::class, 'withdrawPcedo'])->middleware('throttle:5,1');
+        Route::get('/withdrawals',         [ProfileController::class, 'myWithdrawals']);
+        Route::delete('/withdrawals/{id}', [ProfileController::class, 'deleteWithdrawal']);
+        Route::post('/set-skin',           [ProfileController::class, 'setSkin'])->middleware('throttle:20,1');
+        Route::post('/quests/{id}/confirm',[ProfileController::class, 'confirmQuest'])->middleware('throttle:10,1');
     });
 
     // Shop
-    Route::post('/shop/skins/{id}/purchase', [ShopController::class, 'purchase']);
+    Route::post('/shop/skins/{id}/purchase', [ShopController::class, 'purchase'])->middleware('throttle:10,1');
 
-    // Coupons
-    Route::post('/coupons/redeem', [CouponController::class, 'redeem']);
+    // Coupons — 5 attempts/minute (prevents brute-force code guessing)
+    Route::post('/coupons/redeem', [CouponController::class, 'redeem'])->middleware('throttle:5,1');
 
-    // Marketplace (gem purchases)
+    // Marketplace
     Route::prefix('marketplace')->group(function () {
-        Route::post('/initiate',   [MarketplaceController::class, 'initiate']);
-        Route::post('/submit-tx',  [MarketplaceController::class, 'submitTx']);
+        Route::post('/initiate',   [MarketplaceController::class, 'initiate'])->middleware('throttle:10,1');
+        Route::post('/submit-tx',  [MarketplaceController::class, 'submitTx'])->middleware('throttle:5,1');
         Route::get('/status',      [MarketplaceController::class, 'status']);
     });
 });
 
 // ── Admin endpoints ───────────────────────────────────────────────────────────
 Route::prefix('admin')->middleware('admin.auth')->group(function () {
-    Route::post('/login',                [AdminController::class, 'login'])->withoutMiddleware('admin.auth');
+    // Login rate limited hard — 5 attempts per IP per minute
+    Route::post('/login',                [AdminController::class, 'login'])
+        ->withoutMiddleware('admin.auth')
+        ->middleware('throttle:5,1');
+
     Route::get('/stats',                 [AdminController::class, 'stats']);
     Route::get('/coupons',               [AdminController::class, 'coupons']);
     Route::post('/coupons',              [AdminController::class, 'createCoupon']);
